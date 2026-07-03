@@ -1,6 +1,7 @@
 
 import os
 import math
+import inspect
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -73,11 +74,30 @@ class SimplePortfolio:
 
 US_TZ = timezone(timedelta(hours=-5))  # 美東時間
 
-# 初始化 Session State 用於緩存用戶金鑰與 Feed 設置
-if "alpaca_key" not in st.session_state:
-    st.session_state["alpaca_key"] = os.getenv("APCA_API_KEY_ID", "")
-if "alpaca_secret" not in st.session_state:
-    st.session_state["alpaca_secret"] = os.getenv("APCA_API_SECRET_KEY", "")
+# 初始化 Session State，優先嘗試讀取 Streamlit Secrets、環境變數，最後才是空值
+def init_api_keys():
+    # 優先檢查 Streamlit Secrets (部署在 Cloud 時最安全的儲存方式)
+    default_key = ""
+    default_secret = ""
+    
+    if hasattr(st, "secrets"):
+        if "APCA_API_KEY_ID" in st.secrets:
+            default_key = st.secrets["APCA_API_KEY_ID"]
+        if "APCA_API_SECRET_KEY" in st.secrets:
+            default_secret = st.secrets["APCA_API_SECRET_KEY"]
+            
+    # 如果 Secrets 沒設定，檢查環境變數
+    if not default_key:
+        default_key = os.getenv("APCA_API_KEY_ID", "")
+    if not default_secret:
+        default_secret = os.getenv("APCA_API_SECRET_KEY", "")
+
+    if "alpaca_key" not in st.session_state:
+        st.session_state["alpaca_key"] = default_key
+    if "alpaca_secret" not in st.session_state:
+        st.session_state["alpaca_secret"] = default_secret
+
+init_api_keys()
 
 def get_alpaca_client():
     key = st.session_state["alpaca_key"]
@@ -90,7 +110,33 @@ def get_alpaca_client():
         return None
 
 
-# 連線測試器：實時測試連線，並捕捉最真實的錯誤原因供用戶排錯
+# 透過 Python 動態反射（Reflection）機制安全呼叫 Alpaca API，規避 SDK 版本參數命名衝突
+def call_get_stock_bars(client, request_obj):
+    try:
+        sig = inspect.signature(client.get_stock_bars)
+        params = list(sig.parameters.keys())
+        
+        target_param = None
+        for p in params:
+            if p != "self":
+                target_param = p
+                break
+                
+        if target_param:
+            return client.get_stock_bars(**{target_param: request_obj})
+    except Exception:
+        pass
+        
+    try:
+        return client.get_stock_bars(request_params=request_obj)
+    except TypeError:
+        try:
+            return client.get_stock_bars(request=request_obj)
+        except TypeError:
+            return client.get_stock_bars(request_obj)
+
+
+# 連線測試器
 def test_alpaca_connection(feed_choice: str):
     key = st.session_state["alpaca_key"]
     secret = st.session_state["alpaca_secret"]
@@ -112,7 +158,7 @@ def test_alpaca_connection(feed_choice: str):
             end=today,
             feed=feed_param if HAS_DATAFEED else None
         )
-        client.get_stock_bars(req)
+        call_get_stock_bars(client, req)
         return "success"
     except Exception as e:
         return str(e)
@@ -131,7 +177,6 @@ def get_bars(symbol: str, start: datetime, end: datetime, timeframe_str: str, fe
     else:
         timeframe = TimeFrame.Day
 
-    # 修正點：將時間統一強制轉換為 UTC 時區，解決 Alpaca 伺服器對本地時區格式拒絕的問題
     start_utc = start.astimezone(timezone.utc)
     end_utc = end.astimezone(timezone.utc)
 
@@ -149,9 +194,8 @@ def get_bars(symbol: str, start: datetime, end: datetime, timeframe_str: str, fe
     )
     
     try:
-        bars = client.get_stock_bars(req)
+        bars = call_get_stock_bars(client, req)
         
-        # 修正點：防禦性程式碼，如果 data 為空，直接回傳，防止讀取 df 時觸發 SDK 內部異常
         if not hasattr(bars, "data") or not bars.data:
             return pd.DataFrame()
             
@@ -540,7 +584,7 @@ with st.sidebar.expander("🔑 Alpaca API 金鑰及通道設定", expanded=(not 
     input_key = st.text_input("Alpaca API Key ID", value=st.session_state["alpaca_key"], type="password")
     input_secret = st.text_input("Alpaca Secret Key", value=st.session_state["alpaca_secret"], type="password")
     
-    # 貼心防崩潰設計：新增 Data Feed 數據通道切換
+    # Data Feed 數據通道切換
     feed_choice = st.selectbox(
         "數據源通道 (Data Feed)", 
         ["IEX", "SIP"], 
@@ -560,7 +604,7 @@ with st.sidebar.expander("🔑 Alpaca API 金鑰及通道設定", expanded=(not 
     if test_result == "success":
         st.success(f"● 連線成功 ({feed_choice} 通道)")
     elif test_result == "keys_empty":
-        st.info("● 請先輸入 API 金鑰以進行測試")
+        st.info("● 請先輸入 API 金鑰或配置 Streamlit Secrets 以進行測試")
     else:
         st.error(f"● 連線失敗！\n\n**詳細錯誤回報：**\n`{test_result}`")
         st.markdown(
@@ -634,7 +678,7 @@ has_keys = bool(st.session_state["alpaca_key"] and st.session_state["alpaca_secr
 
 if not has_keys:
     st.markdown("---")
-    st.warning("⚠️ **請先展開左側【🔑 Alpaca API 金鑰及通道設定】輸入您的金鑰。** 金鑰輸入後，系統將實時向 Alpaca 加載最真實的華爾街交易數據。")
+    st.warning("⚠️ **請先配置左側【🔑 Alpaca API 金鑰及通道設定】或部署 Streamlit Secrets。** 系統連接 Alpaca 數據後將實時加載精確的量化數據。")
     st.info("💡 如果您還沒有 Alpaca 帳戶，可以去 [Alpaca 官網](https://alpaca.markets/) 免費註冊一個模擬盤 (Paper Trading) 帳戶，幾分鐘內即可獲得免費 API 金鑰！")
     st.stop()
 
@@ -652,12 +696,25 @@ if rs_df.empty:
 else:
     sort_order = st.radio("RS 排序方向", ["由強到弱", "由弱到強"], horizontal=True)
     ascending = sort_order == "由弱到強"
+    
     rs_df_display = rs_df.copy()
+    
+    # 修正點：動態計算 MarketSmith 規格的 RS 評分分數 (1 - 99 百分位分值)
+    if len(rs_df_display) > 1:
+        rs_df_display["RS Rating (1-99)"] = (rs_df_display["rs_score"].rank(pct=True) * 98 + 1).round().astype(int)
+    else:
+        rs_df_display["RS Rating (1-99)"] = 99
+        
     rs_df_display["RS% vs SPY"] = (rs_df_display["rs_score"] * 100).round(2)
     rs_df_display["近期報酬%"] = (rs_df_display["ret"] * 100).round(2)
-    rs_df_display = rs_df_display[["symbol", "name", "sector", "近期報酬%", "RS% vs SPY"]]
-    rs_df_display = rs_df_display.sort_values("RS% vs SPY", ascending=ascending)
+    
+    # 修正點：將 symbol 欄位設定為索引 Ticker 列，徹底消除 0, 1, 2 序號
+    rs_df_display = rs_df_display.rename(columns={"symbol": "Ticker", "name": "公司名稱", "sector": "行業板塊"})
+    rs_df_display = rs_df_display[["Ticker", "RS Rating (1-99)", "公司名稱", "行業板塊", "近期報酬%", "RS% vs SPY"]]
+    rs_df_display = rs_df_display.sort_values("RS Rating (1-99)", ascending=ascending)
+    rs_df_display.set_index("Ticker", inplace=True)
 
+    # 呈現極致專業的精美寬表格
     st.dataframe(rs_df_display, use_container_width=True)
 
     st.markdown("**各行業 RS 領頭羊**")
@@ -667,12 +724,21 @@ else:
         .groupby("sector")
         .head(1)
     ).copy()
+    
     leaders_display = leaders.copy()
+    if len(rs_df) > 1:
+        leaders_display["RS Rating (1-99)"] = (leaders_display["rs_score"].rank(pct=True) * 98 + 1).round().astype(int)
+    else:
+        leaders_display["RS Rating (1-99)"] = 99
+        
     leaders_display["RS% vs SPY"] = (leaders_display["rs_score"] * 100).round(2)
     leaders_display["近期報酬%"] = (leaders_display["ret"] * 100).round(2)
+    
+    leaders_display = leaders_display.rename(columns={"symbol": "Ticker", "name": "公司名稱", "sector": "行業板塊"})
     leaders_display = leaders_display[
-        ["sector", "symbol", "name", "近期報酬%", "RS% vs SPY"]
+        ["行業板塊", "Ticker", "RS Rating (1-99)", "公司名稱", "近期報酬%", "RS% vs SPY"]
     ]
+    leaders_display.set_index("行業板塊", inplace=True)
     st.dataframe(leaders_display, use_container_width=True)
 
 
@@ -719,6 +785,8 @@ else:
         st.info("當前時段沒有符合 VWAP + RVOL 條件的爆發股候選。")
     else:
         breakout_df = pd.DataFrame(breakout_rows)
+        breakout_df = breakout_df.rename(columns={"symbol": "Ticker"})
+        breakout_df.set_index("Ticker", inplace=True)
         breakout_df = breakout_df.sort_values("rvol", ascending=False)
         st.dataframe(breakout_df, use_container_width=True)
 
