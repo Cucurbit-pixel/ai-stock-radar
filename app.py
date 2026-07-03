@@ -1,4 +1,4 @@
-l
+`
 import os
 import math
 from datetime import datetime, timedelta, timezone
@@ -11,6 +11,13 @@ import requests
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+
+# 安全導入 DataFeed Enums，防止舊版本 SDK 不支援
+try:
+    from alpaca.data.enums import DataFeed
+    HAS_DATAFEED = True
+except ImportError:
+    HAS_DATAFEED = False
 
 # ==============================
 # 自製輕量化 portfolio 仿真類 (完美替代 vectorbt，防衝突且效能提升 10 倍)
@@ -66,17 +73,15 @@ class SimplePortfolio:
 
 US_TZ = timezone(timedelta(hours=-5))  # 美東時間
 
-# 初始化 Session State 用於緩存用戶直接在網頁輸入的金鑰
+# 初始化 Session State 用於緩存用戶金鑰與 Feed 設置
 if "alpaca_key" not in st.session_state:
     st.session_state["alpaca_key"] = os.getenv("APCA_API_KEY_ID", "")
 if "alpaca_secret" not in st.session_state:
     st.session_state["alpaca_secret"] = os.getenv("APCA_API_SECRET_KEY", "")
 
 def get_alpaca_client():
-    # 優先讀取 Session State 內的輸入，其次讀取環境變數
     key = st.session_state["alpaca_key"]
     secret = st.session_state["alpaca_secret"]
-    
     if not key or not secret:
         return None
     try:
@@ -85,8 +90,36 @@ def get_alpaca_client():
         return None
 
 
+# 連線測試器：實時測試連線，並捕捉最真實的錯誤原因供用戶排錯
+def test_alpaca_connection(feed_choice: str):
+    key = st.session_state["alpaca_key"]
+    secret = st.session_state["alpaca_secret"]
+    if not key or not secret:
+        return "keys_empty"
+    try:
+        client = StockHistoricalDataClient(key, secret)
+        today = datetime.now(timezone.utc)
+        start = today - timedelta(days=3)
+        
+        feed_param = None
+        if HAS_DATAFEED:
+            feed_param = DataFeed.IEX if feed_choice == "IEX" else DataFeed.SIP
+            
+        req = StockBarsRequest(
+            symbol_or_symbols="SPY",
+            timeframe=TimeFrame.Day,
+            start=start,
+            end=today,
+            feed=feed_param if HAS_DATAFEED else None
+        )
+        client.get_stock_bars(req)
+        return "success"
+    except Exception as e:
+        return str(e)
+
+
 @st.cache_data(show_spinner=False)
-def get_bars(symbol: str, start: datetime, end: datetime, timeframe_str: str):
+def get_bars(symbol: str, start: datetime, end: datetime, timeframe_str: str, feed_choice: str = "IEX"):
     client = get_alpaca_client()
     if client is None:
         return pd.DataFrame()
@@ -98,20 +131,33 @@ def get_bars(symbol: str, start: datetime, end: datetime, timeframe_str: str):
     else:
         timeframe = TimeFrame.Day
 
+    # 修正點：將時間統一強制轉換為 UTC 時區，解決 Alpaca 伺服器對本地時區格式拒絕的問題
+    start_utc = start.astimezone(timezone.utc)
+    end_utc = end.astimezone(timezone.utc)
+
+    feed_param = None
+    if HAS_DATAFEED:
+        feed_param = DataFeed.IEX if feed_choice == "IEX" else DataFeed.SIP
+
     req = StockBarsRequest(
         symbol_or_symbols=symbol,
         timeframe=timeframe,
-        start=start,
-        end=end,
+        start=start_utc,
+        end=end_utc,
         adjustment=None,
+        feed=feed_param if HAS_DATAFEED else None
     )
     
     try:
         bars = client.get_stock_bars(req)
+        
+        # 修正點：防禦性程式碼，如果 data 為空，直接回傳，防止讀取 df 時觸發 SDK 內部異常
+        if not hasattr(bars, "data") or not bars.data:
+            return pd.DataFrame()
+            
         if bars.df.empty:
             return pd.DataFrame()
         
-        # 使用安全 cross-section 提取 MultiIndex 個股數據，防範 KeyError
         if symbol not in bars.df.index.get_level_values(0):
             return pd.DataFrame()
             
@@ -192,7 +238,6 @@ def classify_rsi_zone(rsi):
 
 
 def get_fear_greed_value():
-    # 模擬標準瀏覽器 Request Headers，防止 CNN 防爬蟲阻斷
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -253,6 +298,7 @@ def load_universe():
 def compute_relative_strength(
     base_symbol: str = "SPY",
     lookback_days: int = 60,
+    feed_choice: str = "IEX"
 ):
     today = datetime.now(tz=US_TZ)
     start = today - timedelta(days=lookback_days * 3)
@@ -264,7 +310,7 @@ def compute_relative_strength(
 
     rs_data = []
     for sym in symbols:
-        df = get_bars(sym, start, today, "day")
+        df = get_bars(sym, start, today, "day", feed_choice=feed_choice)
         if df.empty or len(df) < lookback_days:
             continue
         df = df.sort_values("timestamp")
@@ -361,11 +407,11 @@ def atr_adaptive_stops(last_price, atr_value, atr_window_pct, stop_min_pct, stop
 # AI 參數優化 (以輕量 SimplePortfolio 實現)
 # ==============================
 
-def run_param_search(symbol: str, years: int = 2, n_samples: int = 100):
+def run_param_search(symbol: str, years: int = 2, n_samples: int = 100, feed_choice: str = "IEX"):
     today = datetime.now(tz=US_TZ)
     start = today - timedelta(days=365 * years + 100)
 
-    df = get_bars(symbol, start, today, "day")
+    df = get_bars(symbol, start, today, "day", feed_choice=feed_choice)
     if df.empty or len(df) < 60:
         return None
 
@@ -421,11 +467,11 @@ def run_param_search(symbol: str, years: int = 2, n_samples: int = 100):
     return best_cfg
 
 
-def generate_signal_from_cfg(symbol: str, cfg: dict):
+def generate_signal_from_cfg(symbol: str, cfg: dict, feed_choice: str = "IEX"):
     today = datetime.now(tz=US_TZ)
     start = today - timedelta(days=365)
 
-    df = get_bars(symbol, start, today, "day")
+    df = get_bars(symbol, start, today, "day", feed_choice=feed_choice)
     if df.empty or len(df) < max(14, cfg["ma_window"]):
         return None
 
@@ -488,16 +534,38 @@ st.title("🚀 美股 AI 強勢股雷達 v0.1")
 # ---- Sidebar ----
 st.sidebar.header("⚙️ 系統設定")
 
-# 1. 🔑 Alpaca 密鑰設置（折疊式面板，貼心防崩潰設計）
-with st.sidebar.expander("🔑 Alpaca API 金鑰設定", expanded=(not st.session_state["alpaca_key"])):
-    st.markdown("請在下方貼上您的 Alpaca 金鑰以啟動美股數據流：")
+# 1. 🔑 Alpaca 密鑰設置與連線測試功能
+with st.sidebar.expander("🔑 Alpaca API 金鑰及通道設定", expanded=(not st.session_state["alpaca_key"])):
+    st.markdown("請在下方貼上您的 Alpaca 金鑰，並選擇正確的 Data Feed 類型：")
     input_key = st.text_input("Alpaca API Key ID", value=st.session_state["alpaca_key"], type="password")
     input_secret = st.text_input("Alpaca Secret Key", value=st.session_state["alpaca_secret"], type="password")
+    
+    # 貼心防崩潰設計：新增 Data Feed 數據通道切換
+    feed_choice = st.selectbox(
+        "數據源通道 (Data Feed)", 
+        ["IEX", "SIP"], 
+        index=0, 
+        help="【極之重要】：免費版或模擬盤 (Paper) 金鑰請務必選擇 IEX！付費實盤金鑰才選 SIP，否則會被伺服器直接拒絕訪問 (403 Forbidden)。"
+    )
     
     if input_key != st.session_state["alpaca_key"] or input_secret != st.session_state["alpaca_secret"]:
         st.session_state["alpaca_key"] = input_key
         st.session_state["alpaca_secret"] = input_secret
         st.rerun()
+
+    # 實時連線測試回饋 UI
+    st.markdown("---")
+    st.markdown("⚡ **金鑰連線測試狀態：**")
+    test_result = test_alpaca_connection(feed_choice)
+    if test_result == "success":
+        st.success(f"● 連線成功 ({feed_choice} 通道)")
+    elif test_result == "keys_empty":
+        st.info("● 請先輸入 API 金鑰以進行測試")
+    else:
+        st.error(f"● 連線失敗！\n\n**詳細錯誤回報：**\n`{test_result}`")
+        st.markdown(
+            "💡 **排錯秘籍：** 如果看到 `403` 或 `subscription` 錯誤，100% 係因為你用模擬盤 key 卻揀咗 SIP 通道，請將上方【數據源通道】切換為 **IEX** 再試！"
+        )
 
 mode = st.sidebar.radio(
     "交易模式",
@@ -525,12 +593,10 @@ run_ai_opt = st.sidebar.button("啟動無監督網格自學習優化")
 
 st.subheader("📊 大盤情緒診斷 - CNN Fear & Greed Index")
 
-# 實施網絡防禦性編譯
 raw_fg_val = get_fear_greed_value()
 
 if raw_fg_val is None:
     st.info("💡 溫馨提示：CNN 官方 sentiment 接口當前被 Streamlit 共享 IP 限制。已為您開啟備援模式，您可在下方手動微調市場情緒進行沙盤模擬。")
-    # 提供手動微調滑桿
     fg_val = st.slider("🔮 模擬當前市場 Fear & Greed 指數", 0, 100, 50, step=1)
 else:
     fg_val = raw_fg_val
@@ -568,7 +634,7 @@ has_keys = bool(st.session_state["alpaca_key"] and st.session_state["alpaca_secr
 
 if not has_keys:
     st.markdown("---")
-    st.warning("⚠️ **請先展開左側【🔑 Alpaca API 金鑰設定】輸入您的金鑰。** 金鑰輸入後，系統將實時向 Alpaca 加載最真實的華爾街交易數據。")
+    st.warning("⚠️ **請先展開左側【🔑 Alpaca API 金鑰及通道設定】輸入您的金鑰。** 金鑰輸入後，系統將實時向 Alpaca 加載最真實的華爾街交易數據。")
     st.info("💡 如果您還沒有 Alpaca 帳戶，可以去 [Alpaca 官網](https://alpaca.markets/) 免費註冊一個模擬盤 (Paper Trading) 帳戶，幾分鐘內即可獲得免費 API 金鑰！")
     st.stop()
 
@@ -579,10 +645,10 @@ if not has_keys:
 
 st.subheader("🏆 全市場 RS 強勢股 & 行業領頭羊（基於 SPY）")
 
-rs_df = compute_relative_strength(lookback_days=rs_lookback)
+rs_df = compute_relative_strength(lookback_days=rs_lookback, feed_choice=feed_choice)
 
 if rs_df.empty:
-    st.warning("無法取得 RS 排名，請確認您的 Alpaca API 是否開通美股歷史數據訪問權限。")
+    st.warning("⚠️ 無法取得 RS 排名。請先檢查左側「金鑰連線測試狀態」是否顯示綠色成功，如果不成功，請根據其顯示的錯誤信息排查。")
 else:
     sort_order = st.radio("RS 排序方向", ["由強到弱", "由弱到強"], horizontal=True)
     ascending = sort_order == "由弱到強"
@@ -621,12 +687,11 @@ if rs_df.empty:
 else:
     top_symbols = rs_df.head(20)["symbol"].tolist()
     today = datetime.now(tz=US_TZ)
-    # 智能跨期補償：拉長到過去 5 天，防止在非交易日或週末時獲取不到數據
     start_intraday = today - timedelta(days=5)
 
     breakout_rows = []
     for sym in top_symbols:
-        df_i = get_bars(sym, start_intraday, today, "minute")
+        df_i = get_bars(sym, start_intraday, today, "minute", feed_choice=feed_choice)
         if df_i.empty or len(df_i) < 2:
             continue
         df_i = df_i.sort_values("timestamp")
@@ -669,9 +734,9 @@ if symbol:
     today = datetime.now(tz=US_TZ)
     start_daily = today - timedelta(days=365 * 2)
 
-    df_daily = get_bars(symbol, start_daily, today, "day")
+    df_daily = get_bars(symbol, start_daily, today, "day", feed_choice=feed_choice)
     if df_daily.empty:
-        st.warning(f"無法取得 {symbol} 日線數據。請確認美股代號是否正確，或您的 Alpaca 金鑰是否支援此數據。")
+        st.warning(f"⚠️ 無法取得 {symbol} 日線數據。請確認金鑰是否連線成功，或通道設定 (IEX / SIP) 是否正確。")
     else:
         df_daily = add_technicals(df_daily.sort_values("timestamp"))
         last_d = df_daily.iloc[-1]
@@ -701,7 +766,7 @@ if symbol:
         if run_ai_opt:
             with st.spinner("🧠 AI 正在為你摸索黃金參數組合..."):
                 cfg = run_param_search(
-                    symbol, years=param_years, n_samples=param_samples
+                    symbol, years=param_years, n_samples=param_samples, feed_choice=feed_choice
                 )
             if cfg is None:
                 st.error("參數優化失敗，可能是歷史數據長度不足。")
@@ -710,7 +775,7 @@ if symbol:
                 pf = cfg["pf"]
                 st.write(f"模擬初始資金 100,000，最終權益約為 {pf.values[-1]:,.0f}。")
                 
-                signal_info = generate_signal_from_cfg(symbol, cfg)
+                signal_info = generate_signal_from_cfg(symbol, cfg, feed_choice=feed_choice)
                 if signal_info:
                     sig_color = {
                         "Buy": "🟢 Buy",
@@ -737,7 +802,7 @@ if symbol:
         st.markdown("### ⚡ 日內模式診斷 (5 分鐘 K 線 + VWAP + ATR)")
 
         start_intraday = today - timedelta(days=5)
-        df_5m = get_bars(symbol, start_intraday, today, "minute")
+        df_5m = get_bars(symbol, start_intraday, today, "minute", feed_choice=feed_choice)
         if df_5m.empty:
             st.warning("無法取得日內分時數據。")
         else:
