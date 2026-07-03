@@ -90,11 +90,20 @@ def get_alpaca_client():
     return StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
 
 
+# 修正點：將 timeframe 參數改成 timeframe_str (String 類型)，確保 Streamlit 緩存能成功雜湊 (Hash)
 @st.cache_data(show_spinner=False)
-def get_bars(symbol, start, end, timeframe: TimeFrame):
+def get_bars(symbol: str, start: datetime, end: datetime, timeframe_str: str):
     client = get_alpaca_client()
     if client is None:
         return pd.DataFrame()
+
+    # 根據字串參數對應到 Alpaca 的 TimeFrame 物件
+    if timeframe_str == "day":
+        timeframe = TimeFrame.Day
+    elif timeframe_str == "minute":
+        timeframe = TimeFrame.Minute
+    else:
+        timeframe = TimeFrame.Day
 
     req = StockBarsRequest(
         symbol_or_symbols=symbol,
@@ -106,7 +115,6 @@ def get_bars(symbol, start, end, timeframe: TimeFrame):
     
     try:
         bars = client.get_stock_bars(req)
-        # 修正點：Alpaca SDK 回傳的是 StockBarsResponse 物件，需透過 .df 屬性檢查與存取
         if bars.df.empty:
             return pd.DataFrame()
         
@@ -199,7 +207,6 @@ def get_fear_greed_value():
         except Exception:
             pass
 
-    # 修正點：加入 User-Agent 避免 CNN 拋出 403 Forbidden 拒絕訪問
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -270,7 +277,8 @@ def compute_relative_strength(
 
     rs_data = []
     for sym in symbols:
-        df = get_bars(sym, start, today, TimeFrame.Day)
+        # 修正點：將原 TimeFrame.Day 改成字串 "day"
+        df = get_bars(sym, start, today, "day")
         if df.empty or len(df) < lookback_days:
             continue
         df = df.sort_values("timestamp")
@@ -371,7 +379,8 @@ def run_param_search(symbol: str, years: int = 2, n_samples: int = 100):
     today = datetime.now(tz=US_TZ)
     start = today - timedelta(days=365 * years + 100) # 多抓時間給指標預熱
 
-    df = get_bars(symbol, start, today, TimeFrame.Day)
+    # 修正點：將原 TimeFrame.Day 改成字串 "day"
+    df = get_bars(symbol, start, today, "day")
     if df.empty or len(df) < 60:
         return None
 
@@ -399,11 +408,9 @@ def run_param_search(symbol: str, years: int = 2, n_samples: int = 100):
         entries = (price > ma) & (rsi < rsi_buy)
         exits = (rsi > 70) | (price < ma)
 
-        # 確保信號陣列沒有全空
         if not entries.any():
             continue
 
-        # 替換點：使用自製仿真類進行高效率回測
         pf = SimplePortfolio.from_signals(
             price,
             entries=entries,
@@ -433,7 +440,8 @@ def generate_signal_from_cfg(symbol: str, cfg: dict):
     today = datetime.now(tz=US_TZ)
     start = today - timedelta(days=365)
 
-    df = get_bars(symbol, start, today, TimeFrame.Day)
+    # 修正點：將原 TimeFrame.Day 改成字串 "day"
+    df = get_bars(symbol, start, today, "day")
     if df.empty or len(df) < max(14, cfg["ma_window"]):
         return None
 
@@ -600,7 +608,8 @@ else:
 
     breakout_rows = []
     for sym in top_symbols:
-        df_i = get_bars(sym, start_intraday, today, TimeFrame.Minute)
+        # 修正點：將原 TimeFrame.Minute 改成字串 "minute"
+        df_i = get_bars(sym, start_intraday, today, "minute")
         if df_i.empty or len(df_i) < 2:
             continue
         df_i = df_i.sort_values("timestamp")
@@ -642,7 +651,8 @@ if symbol:
     today = datetime.now(tz=US_TZ)
     start_daily = today - timedelta(days=365 * 2)
 
-    df_daily = get_bars(symbol, start_daily, today, TimeFrame.Day)
+    # 修正點：將原 TimeFrame.Day 改成字串 "day"
+    df_daily = get_bars(symbol, start_daily, today, "day")
     if df_daily.empty:
         st.warning(f"無法取得 {symbol} 日線數據。請確認代號或 Alpaca 權限。")
     else:
@@ -711,11 +721,11 @@ if symbol:
         st.markdown("### ⚡ 日內模式診斷 (5 分鐘 K 線 + VWAP + ATR)")
 
         start_intraday = today - timedelta(days=5) # 抓多幾日數據確保有足夠的 K 線做 resampling
-        df_5m = get_bars(symbol, start_intraday, today, TimeFrame.Minute)
+        # 修正點：將原 TimeFrame.Minute 改成字串 "minute"
+        df_5m = get_bars(symbol, start_intraday, today, "minute")
         if df_5m.empty:
             st.warning("無法取得日內分時數據。")
         else:
-            # 修正點：將 "5T" 改為新版標准 "5min"
             df_5m = df_5m.set_index("timestamp").resample("5min").agg(
                 {
                     "open": "first",
@@ -772,5 +782,4 @@ if symbol:
                     st.info("目前處於波段/位置交易模式，如要使用日內判定，請在側邊選單切換。")
 else:
     st.info("請在側邊欄輸入想診斷的股票代碼。")
-
 
