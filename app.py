@@ -26,6 +26,7 @@ except ImportError:
 
 US_TZ = timezone(timedelta(hours=-5))  # 美東時間
 
+# 建議優先確保環境變數讀取正常
 ALPACA_API_KEY = os.getenv("APCA_API_KEY_ID")
 ALPACA_API_SECRET = os.getenv("APCA_API_SECRET_KEY")
 
@@ -48,29 +49,38 @@ def get_bars(symbol, start, end, timeframe: TimeFrame):
         start=start,
         end=end,
         adjustment=None,
-        limit=10000,
     )
-    bars = client.get_stock_bars(req)
-    if symbol not in bars:
+    
+    try:
+        bars = client.get_stock_bars(req)
+        # 修正點：Alpaca SDK 回傳的是 StockBarsResponse 物件，需透過 .df 屬性檢查與存取
+        if bars.df.empty:
+            return pd.DataFrame()
+        
+        # 提取 MultiIndex 中的指定個股數據
+        if symbol not in bars.df.index.levels[0]:
+            return pd.DataFrame()
+            
+        df = bars.df.loc[symbol].reset_index()
+        
+        df = df.rename(
+            columns={
+                "timestamp": "timestamp",
+                "open": "open",
+                "high": "high",
+                "low": "low",
+                "close": "close",
+                "volume": "volume",
+            }
+        )
+        df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_convert(US_TZ)
+        return df
+    except Exception as e:
         return pd.DataFrame()
-
-    df = bars[symbol].df.reset_index()
-    df = df.rename(
-        columns={
-            "timestamp": "timestamp",
-            "open": "open",
-            "high": "high",
-            "low": "low",
-            "close": "close",
-            "volume": "volume",
-        }
-    )
-    df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_convert(US_TZ)
-    return df
 
 
 def add_technicals(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
+    if df.empty or len(df) < 2:
         return df
 
     df = df.copy()
@@ -83,11 +93,11 @@ def add_technicals(df: pd.DataFrame) -> pd.DataFrame:
     delta = df["close"].diff()
     gain = np.where(delta > 0, delta, 0.0)
     loss = np.where(delta < 0, -delta, 0.0)
-    roll_up = pd.Series(gain).rolling(14).mean()
-    roll_down = pd.Series(loss).rolling(14).mean()
-    rs = roll_up / roll_down
+    roll_up = pd.Series(gain, index=df.index).rolling(14).mean()
+    roll_down = pd.Series(loss, index=df.index).rolling(14).mean()
+    rs = roll_up / roll_down.replace(0, np.nan) # 防止除以 0
     rsi = 100.0 - (100.0 / (1.0 + rs))
-    df["rsi14"] = rsi.values
+    df["rsi14"] = rsi.fillna(100.0).values
 
     # ATR 14
     high_low = df["high"] - df["low"]
@@ -96,21 +106,23 @@ def add_technicals(df: pd.DataFrame) -> pd.DataFrame:
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df["atr14"] = tr.rolling(14).mean()
 
-    # VWAP（對 intraday 用）
+    # VWAP
     if "vwap" not in df.columns:
         typical_price = (df["high"] + df["low"] + df["close"]) / 3.0
         df["cum_vol"] = df["volume"].cumsum()
         df["cum_vp"] = (typical_price * df["volume"]).cumsum()
-        df["vwap"] = df["cum_vp"] / df["cum_vol"]
+        df["vwap"] = df["cum_vp"] / df["cum_vol"].replace(0, np.nan)
 
     # Chaikin Money Flow (CMF 20)
     period = 20
-    mfm = ((df["close"] - df["low"]) - (df["high"] - df["close"])) / (
-        df["high"] - df["low"]
-    )
-    mfm = mfm.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    denom = (df["high"] - df["low"]).replace(0, np.nan)
+    mfm = ((df["close"] - df["low"]) - (df["high"] - df["close"])) / denom
+    mfm = mfm.fillna(0.0)
     mfv = mfm * df["volume"]
-    df["cmf20"] = mfv.rolling(period).sum() / df["volume"].rolling(period).sum()
+    
+    vol_sum = df["volume"].rolling(period).sum()
+    df["cmf20"] = mfv.rolling(period).sum() / vol_sum.replace(0, np.nan)
+    df["cmf20"] = df["cmf20"].fillna(0.0)
 
     return df
 
@@ -126,20 +138,22 @@ def classify_rsi_zone(rsi):
 
 
 def get_fear_greed_value():
-    # 優先用 fear-greed 套件，否則用簡單 HTTP 備援
-    try:
-        if HAS_FEAR_GREED_LIB:
+    if HAS_FEAR_GREED_LIB:
+        try:
             data = get_fear_and_greed()
-            # library 回傳格式：{"fear_and_greed": {"now": {"value": 67, "text": "Greed"}, ...}}
             val = data["fear_and_greed"]["now"]["value"]
             return int(val)
-    except Exception:
-        pass
+        except Exception:
+            pass
 
-    # 簡單 HTTP 備援（如失敗則回 None）
+    # 修正點：加入 User-Agent 避免 CNN 拋出 403 Forbidden 拒絕訪問
     try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
         resp = requests.get(
             "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
+            headers=headers,
             timeout=5,
         )
         if resp.ok:
@@ -154,11 +168,11 @@ def get_fear_greed_value():
 
 def interpret_fear_greed(val: int) -> str:
     if val is None:
-        return "無法取得 Fear & Greed 指數"
+        return "無法取得 Fear & Greed 指數，請檢查網絡連接或 API 狀態。"
     if val > 75:
         return "極度貪婪：市場高風險區，避免追高，適合分批止盈與提高止損。"
     if val < 30:
-        return "極度恐慌：泥沙俱下，往往是黃金建倉區，留意大膽進場機會。"
+        return "極度恐慌：泥沙俱下，往往是黃金建倉區，留意大膽分批進場機會。"
     if 40 <= val <= 70:
         return "正常震盪區：適合做突破交易與趨勢跟隨。"
     return "中性區：可按照個股技術面靈活操作。"
@@ -170,7 +184,6 @@ def interpret_fear_greed(val: int) -> str:
 
 @st.cache_data(show_spinner=True)
 def load_universe():
-    # 你可以改成從 CSV 或資料庫載入，只要回傳有 symbol / name / sector 欄位的 DataFrame 即可
     data = [
         ("AAPL", "Apple", "Technology"),
         ("MSFT", "Microsoft", "Technology"),
@@ -195,22 +208,21 @@ def compute_relative_strength(
     lookback_days: int = 60,
 ):
     today = datetime.now(tz=US_TZ)
-    start = today - timedelta(days=lookback_days * 2)
+    start = today - timedelta(days=lookback_days * 3)  # 稍微拉長確保均線與技術指標計算完整
 
     universe = load_universe()
     symbols = universe["symbol"].tolist()
     if base_symbol not in symbols:
         symbols.append(base_symbol)
 
-    # 取日線
     rs_data = []
     for sym in symbols:
         df = get_bars(sym, start, today, TimeFrame.Day)
-        if df.empty:
+        if df.empty or len(df) < lookback_days:
             continue
         df = df.sort_values("timestamp")
         df = add_technicals(df)
-        # 近 lookback_days 報酬
+        
         df_recent = df.tail(lookback_days)
         if len(df_recent) < lookback_days // 2:
             continue
@@ -222,7 +234,7 @@ def compute_relative_strength(
         return pd.DataFrame()
 
     base_ret = rs_df.loc[rs_df["symbol"] == base_symbol, "ret"].iloc[0]
-    rs_df = rs_df[rs_df["symbol"] != base_symbol]
+    rs_df = rs_df[rs_df["symbol"] != base_symbol].copy()
     rs_df = rs_df.merge(load_universe(), on="symbol", how="left")
     rs_df["rs_score"] = rs_df["ret"] - base_ret
     rs_df = rs_df.sort_values("rs_score", ascending=False)
@@ -234,11 +246,11 @@ def compute_relative_strength(
 # ==============================
 
 def calc_rvol(df: pd.DataFrame, window: int = 20) -> pd.Series:
-    if df.empty:
-        return pd.Series(dtype=float)
+    if df.empty or len(df) < window:
+        return pd.Series(np.nan, index=df.index)
     vol = df["volume"]
     avg_vol = vol.rolling(window).mean()
-    rvol = vol / avg_vol
+    rvol = vol / avg_vol.replace(0, np.nan)
     return rvol
 
 
@@ -258,9 +270,9 @@ def evaluate_daytrade_conditions(df: pd.DataFrame):
     vwap = last["vwap"]
     cmf = last["cmf20"]
 
-    cond_price_ma = price > ma5 and price > ma20
+    cond_price_ma = (price > ma5) and (price > ma20) if not (np.isnan(ma5) or np.isnan(ma20)) else False
     cond_rsi = 45 <= rsi <= 65
-    cond_vwap = price > vwap
+    cond_vwap = price > vwap if not np.isnan(vwap) else False
     cond_cmf = cmf > 0.1  # 主力吸籌
 
     return {
@@ -279,15 +291,14 @@ def evaluate_daytrade_conditions(df: pd.DataFrame):
 
 
 def atr_adaptive_stops(last_price, atr_value, atr_window_pct, stop_min_pct, stop_max_pct):
-    # atr_window_pct: ATR / Close 的百分比
-    if np.isnan(atr_value) or atr_value <= 0:
+    if np.isnan(atr_value) or atr_value <= 0 or np.isnan(last_price) or last_price <= 0:
         stop_loss_pct = stop_min_pct
     else:
         atr_pct = atr_value / last_price
-        stop_loss_pct = atr_pct * atr_window_pct  # 例如 1.5 倍 ATR
+        stop_loss_pct = atr_pct * atr_window_pct  # 例如 1.5 倍 ATR 乘數
         stop_loss_pct = max(stop_min_pct, min(stop_loss_pct, stop_max_pct))
 
-    take_profit_pct = stop_loss_pct * 1.8  # 簡單設為 1.8 倍 RR
+    take_profit_pct = stop_loss_pct * 1.8  # 1.8 倍盈虧比
     stop_loss_price = last_price * (1 - stop_loss_pct)
     take_profit_price = last_price * (1 + take_profit_pct)
 
@@ -305,7 +316,7 @@ def atr_adaptive_stops(last_price, atr_value, atr_window_pct, stop_min_pct, stop
 
 def run_param_search(symbol: str, years: int = 2, n_samples: int = 100):
     today = datetime.now(tz=US_TZ)
-    start = today - timedelta(days=365 * years)
+    start = today - timedelta(days=365 * years + 100) # 多抓時間給指標預熱
 
     df = get_bars(symbol, start, today, TimeFrame.Day)
     if df.empty or len(df) < 60:
@@ -317,24 +328,27 @@ def run_param_search(symbol: str, years: int = 2, n_samples: int = 100):
     best_cfg = None
     best_final_equity = -np.inf
 
-    # 隨機抽樣 100 組（RSI 買入 25~45, MA 10~30）
     rng = np.random.default_rng(42)
     for _ in range(n_samples):
         rsi_buy = int(rng.integers(25, 46))
         ma_window = int(rng.integers(10, 31))
 
-        # 計算 MA 與 RSI
         ma = price.rolling(ma_window).mean()
         delta = price.diff()
         gain = np.where(delta > 0, delta, 0.0)
         loss = np.where(delta < 0, -delta, 0.0)
         roll_up = pd.Series(gain).rolling(14).mean()
         roll_down = pd.Series(loss).rolling(14).mean()
-        rs = roll_up / roll_down
+        rs = roll_up / roll_down.replace(0, np.nan)
         rsi = 100.0 - (100.0 / (1.0 + rs))
+        rsi = rsi.fillna(100.0)
 
         entries = (price > ma) & (rsi < rsi_buy)
         exits = (rsi > 70) | (price < ma)
+
+        # 確保信號陣列沒有全空
+        if not entries.any():
+            continue
 
         pf = vbt.Portfolio.from_signals(
             price,
@@ -344,6 +358,9 @@ def run_param_search(symbol: str, years: int = 2, n_samples: int = 100):
             fees=0.0005,
             freq="1D",
         )
+        
+        if len(pf.values) == 0:
+            continue
         final_equity = pf.values[-1]
 
         if final_equity > best_final_equity:
@@ -363,7 +380,7 @@ def generate_signal_from_cfg(symbol: str, cfg: dict):
     start = today - timedelta(days=365)
 
     df = get_bars(symbol, start, today, TimeFrame.Day)
-    if df.empty:
+    if df.empty or len(df) < max(14, cfg["ma_window"]):
         return None
 
     df = df.sort_values("timestamp").reset_index(drop=True)
@@ -371,7 +388,8 @@ def generate_signal_from_cfg(symbol: str, cfg: dict):
     last = df.iloc[-1]
 
     price = last["close"]
-    ma = df["close"].rolling(cfg["ma_window"]).mean().iloc[-1]
+    ma_series = df["close"].rolling(cfg["ma_window"]).mean()
+    ma = ma_series.iloc[-1]
     rsi = last["rsi14"]
 
     if price > ma and rsi < cfg["rsi_buy"]:
@@ -381,9 +399,8 @@ def generate_signal_from_cfg(symbol: str, cfg: dict):
     else:
         signal = "Hold"
 
-    # ATR-based 風控
     atr = last["atr14"]
-    atr_pct = atr / price if atr and price else 0.02
+    atr_pct = atr / price if (atr and price and price > 0) else 0.02
     stop_loss_price = price * (1 - atr_pct * 1.5)
     take_profit_price = price * (1 + atr_pct * 2.0)
 
@@ -404,7 +421,6 @@ def generate_signal_from_cfg(symbol: str, cfg: dict):
 # ==============================
 
 def get_smart_money_metrics(symbol: str):
-    # 這裡先預留欄位，之後可接其他 API（如 FMP / Finnhub）
     return {
         "institutional_held": None,
         "insider_held": None,
@@ -487,7 +503,7 @@ st.subheader("🏆 全市場 RS 強勢股 & 行業領頭羊（基於 SPY）")
 rs_df = compute_relative_strength(lookback_days=rs_lookback)
 
 if rs_df.empty:
-    st.warning("無法取得 RS 排名，請檢查 Alpaca API 是否設定正確。")
+    st.warning("無法取得 RS 排名，請檢查 Alpaca API 是否設定正確以及環境變數。")
 else:
     sort_order = st.radio("RS 排序方向", ["由強到弱", "由弱到強"], horizontal=True)
     ascending = sort_order == "由弱到強"
@@ -506,7 +522,7 @@ else:
         .sort_values(["sector", "rank"])
         .groupby("sector")
         .head(1)
-    )
+    ).copy()
     leaders_display = leaders.copy()
     leaders_display["RS% vs SPY"] = (leaders_display["rs_score"] * 100).round(2)
     leaders_display["近期報酬%"] = (leaders_display["ret"] * 100).round(2)
@@ -524,7 +540,6 @@ st.subheader("🔥 開市前 5–10 分鐘 & 開盤 15 分鐘 VWAP + RVOL 衝刺
 if rs_df.empty:
     st.info("等待 RS 列表載入完成後再顯示衝刺雷達。")
 else:
-    # 取 RS 前幾名作為候選（全美股會太重，這裡先用前 20 名）
     top_symbols = rs_df.head(20)["symbol"].tolist()
     today = datetime.now(tz=US_TZ)
     start_intraday = today - timedelta(hours=4)
@@ -532,7 +547,7 @@ else:
     breakout_rows = []
     for sym in top_symbols:
         df_i = get_bars(sym, start_intraday, today, TimeFrame.Minute)
-        if df_i.empty:
+        if df_i.empty or len(df_i) < 2:
             continue
         df_i = df_i.sort_values("timestamp")
         df_i = add_technicals(df_i)
@@ -542,14 +557,15 @@ else:
         price = last["close"]
         vwap = last["vwap"]
         rvol = last["rvol"]
-        cond_breakout = (price > vwap) and (rvol is not None) and (rvol > 1.5)
+        
+        cond_breakout = (price > vwap) and (not np.isnan(rvol)) and (rvol > 1.5) if not np.isnan(vwap) else False
 
         breakout_rows.append(
             {
                 "symbol": sym,
                 "price": round(price, 2),
-                "vwap": round(vwap, 2),
-                "rvol": round(rvol, 2) if not math.isinf(rvol) and not math.isnan(rvol) else None,
+                "vwap": round(vwap, 2) if not np.isnan(vwap) else None,
+                "rvol": round(rvol, 2) if not (math.isinf(rvol) or np.isnan(rvol)) else None,
                 "status": "🔥 Breakout!" if cond_breakout else "",
             }
         )
@@ -594,35 +610,26 @@ if symbol:
 
         st.write(f"RSI 狀態：**{classify_rsi_zone(last_d['rsi14'])}**")
 
-        # Smart Money Board (預留)
+        # Smart Money Board
         sm = get_smart_money_metrics(symbol)
         st.markdown("#### 💼 華爾街籌碼追蹤（預留）")
-        st.write(
-            f"- 機構持股比例：{sm['institutional_held'] if sm['institutional_held'] is not None else '待接 API'}"
-        )
-        st.write(
-            f"- 內部人持股比例：{sm['insider_held'] if sm['insider_held'] is not None else '待接 API'}"
-        )
-        st.write(
-            f"- 空頭持倉佔比：{sm['short_float'] if sm['short_float'] is not None else '待接 API'}"
-        )
+        st.write(f"- 機構持股比例：{sm['institutional_held'] if sm['institutional_held'] is not None else '待接 API'}")
+        st.write(f"- 內部人持股比例：{sm['insider_held'] if sm['insider_held'] is not None else '待接 API'}")
+        st.write(f"- 空頭持倉佔比：{sm['short_float'] if sm['short_float'] is not None else '待接 API'}")
 
         # AI 參數優化
         if run_ai_opt:
-            with st.spinner("🧠 AI 正在為你摸索黃金參數組合（約 1–3 秒）..."):
+            with st.spinner("🧠 AI 正在為你摸索黃金參數組合..."):
                 cfg = run_param_search(
                     symbol, years=param_years, n_samples=param_samples
                 )
             if cfg is None:
                 st.error("參數優化失敗，可能是歷史數據不足。")
             else:
-                st.success(
-                    f"🎆 AI 完成自學習！最佳組合：RSI 買入 < {cfg['rsi_buy']}, MA{cfg['ma_window']}。"
-                )
+                st.success(f"🎆 AI 完成自學習！最佳組合：RSI 買入 < {cfg['rsi_buy']}, MA{cfg['ma_window']}。")
                 pf = cfg["pf"]
-                st.write(
-                    f"模擬初始資金 100,000，最終權益約為 {pf.values[-1]:,.0f}。"
-                )
+                st.write(f"模擬初始資金 100,000，最終權益約為 {pf.values[-1]:,.0f}。")
+                
                 signal_info = generate_signal_from_cfg(symbol, cfg)
                 if signal_info:
                     sig_color = {
@@ -649,13 +656,13 @@ if symbol:
         st.markdown("---")
         st.markdown("### ⚡ 日內模式診斷 (5 分鐘 K 線 + VWAP + ATR)")
 
-        start_intraday = today - timedelta(hours=6)
+        start_intraday = today - timedelta(days=5) # 抓多幾日數據確保有足夠的 K 線做 resampling
         df_5m = get_bars(symbol, start_intraday, today, TimeFrame.Minute)
         if df_5m.empty:
             st.warning("無法取得日內分時數據。")
         else:
-            # 壓成 5 分鐘
-            df_5m = df_5m.set_index("timestamp").resample("5T").agg(
+            # 修正點：將 "5T" 改為新版標准 "5min"
+            df_5m = df_5m.set_index("timestamp").resample("5min").agg(
                 {
                     "open": "first",
                     "high": "max",
@@ -685,7 +692,7 @@ if symbol:
                 with dt_col2:
                     atr = info_intraday["atr14"]
                     last_price = info_intraday["price"]
-                    atr_pct = atr / last_price if atr and last_price else 0.02
+                    atr_pct = atr / last_price if (atr and last_price and last_price > 0) else 0.02
                     stops = atr_adaptive_stops(
                         last_price,
                         atr,
@@ -693,12 +700,8 @@ if symbol:
                         daytrade_stop_min / 100.0,
                         daytrade_stop_max / 100.0,
                     )
-                    st.write(
-                        f"ATR% ≈ {atr_pct*100:.2f}%，自適應止損 ≈ {stops['stop_loss_pct']*100:.2f}%"
-                    )
-                    st.write(
-                        f"建議日內止損價 ≈ {stops['stop_loss_price']:.2f}，止盈價 ≈ {stops['take_profit_price']:.2f}"
-                    )
+                    st.write(f"ATR% ≈ {atr_pct*100:.2f}%，自適應止損 ≈ {stops['stop_loss_pct']*100:.2f}%")
+                    st.write(f"建議日內止損價 ≈ {stops['stop_loss_price']:.2f}，止盈價 ≈ {stops['take_profit_price']:.2f}")
 
                 cond_buy = (
                     info_intraday["cond_price_ma"]
@@ -713,6 +716,5 @@ if symbol:
                         st.markdown("### ⏸ 日內條件未完全符合：暫時觀望 🟡")
                 else:
                     st.info("目前處於波段/位置交易模式，如要使用日內判定，請在側邊選單切換。")
-
 else:
     st.info("請在側邊欄輸入想診斷的股票代碼。")
