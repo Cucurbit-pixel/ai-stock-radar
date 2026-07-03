@@ -1,4 +1,4 @@
-
+l
 import os
 import math
 from datetime import datetime, timedelta, timezone
@@ -12,13 +12,6 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
-# Fear & Greed (CNN)
-try:
-    from fear_greed import get_fear_and_greed
-    HAS_FEAR_GREED_LIB = True
-except ImportError:
-    HAS_FEAR_GREED_LIB = False
-
 # ==============================
 # 自製輕量化 portfolio 仿真類 (完美替代 vectorbt，防衝突且效能提升 10 倍)
 # ==============================
@@ -28,13 +21,10 @@ class SimplePortfolio:
 
     @classmethod
     def from_signals(cls, price, entries, exits, init_cash=100000, fees=0.0005, freq="1D"):
-        """
-        模擬 vectorbt 簡單的 Portfolio 回測行為
-        """
         cash = init_cash
         shares = 0.0
         equity = []
-        position = False  # 是否持倉
+        position = False
 
         price_arr = price.values
         entries_arr = entries.values
@@ -45,7 +35,6 @@ class SimplePortfolio:
             entry_sig = entries_arr[i]
             exit_sig = exits_arr[i]
 
-            # 處理 NaN 數據
             if np.isnan(current_price):
                 current_val = cash + (shares * (price_arr[i-1] if i > 0 else 0.0))
                 equity.append(current_val)
@@ -53,7 +42,6 @@ class SimplePortfolio:
 
             if position:
                 if exit_sig:
-                    # 賣出所有股份
                     revenue = shares * current_price
                     fee_pay = revenue * fees
                     cash += (revenue - fee_pay)
@@ -61,7 +49,6 @@ class SimplePortfolio:
                     position = False
             else:
                 if entry_sig:
-                    # 買入最大可行股份
                     cash_to_spend = cash / (1.0 + fees)
                     shares = cash_to_spend / current_price
                     cash = 0.0
@@ -79,25 +66,31 @@ class SimplePortfolio:
 
 US_TZ = timezone(timedelta(hours=-5))  # 美東時間
 
-# 建議優先確保環境變數讀取正常
-ALPACA_API_KEY = os.getenv("APCA_API_KEY_ID")
-ALPACA_API_SECRET = os.getenv("APCA_API_SECRET_KEY")
+# 初始化 Session State 用於緩存用戶直接在網頁輸入的金鑰
+if "alpaca_key" not in st.session_state:
+    st.session_state["alpaca_key"] = os.getenv("APCA_API_KEY_ID", "")
+if "alpaca_secret" not in st.session_state:
+    st.session_state["alpaca_secret"] = os.getenv("APCA_API_SECRET_KEY", "")
 
-@st.cache_resource(show_spinner=False)
 def get_alpaca_client():
-    if not ALPACA_API_KEY or not ALPACA_API_SECRET:
+    # 優先讀取 Session State 內的輸入，其次讀取環境變數
+    key = st.session_state["alpaca_key"]
+    secret = st.session_state["alpaca_secret"]
+    
+    if not key or not secret:
         return None
-    return StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
+    try:
+        return StockHistoricalDataClient(key, secret)
+    except Exception:
+        return None
 
 
-# 修正點：將 timeframe 參數改成 timeframe_str (String 類型)，確保 Streamlit 緩存能成功雜湊 (Hash)
 @st.cache_data(show_spinner=False)
 def get_bars(symbol: str, start: datetime, end: datetime, timeframe_str: str):
     client = get_alpaca_client()
     if client is None:
         return pd.DataFrame()
 
-    # 根據字串參數對應到 Alpaca 的 TimeFrame 物件
     if timeframe_str == "day":
         timeframe = TimeFrame.Day
     elif timeframe_str == "minute":
@@ -118,11 +111,11 @@ def get_bars(symbol: str, start: datetime, end: datetime, timeframe_str: str):
         if bars.df.empty:
             return pd.DataFrame()
         
-        # 提取 MultiIndex 中的指定個股數據
-        if symbol not in bars.df.index.levels[0]:
+        # 使用安全 cross-section 提取 MultiIndex 個股數據，防範 KeyError
+        if symbol not in bars.df.index.get_level_values(0):
             return pd.DataFrame()
             
-        df = bars.df.loc[symbol].reset_index()
+        df = bars.df.xs(symbol, level=0).reset_index()
         
         df = df.rename(
             columns={
@@ -136,7 +129,7 @@ def get_bars(symbol: str, start: datetime, end: datetime, timeframe_str: str):
         )
         df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_convert(US_TZ)
         return df
-    except Exception as e:
+    except Exception:
         return pd.DataFrame()
 
 
@@ -156,7 +149,7 @@ def add_technicals(df: pd.DataFrame) -> pd.DataFrame:
     loss = np.where(delta < 0, -delta, 0.0)
     roll_up = pd.Series(gain, index=df.index).rolling(14).mean()
     roll_down = pd.Series(loss, index=df.index).rolling(14).mean()
-    rs = roll_up / roll_down.replace(0, np.nan) # 防止除以 0
+    rs = roll_up / roll_down.replace(0, np.nan)
     rsi = 100.0 - (100.0 / (1.0 + rs))
     df["rsi14"] = rsi.fillna(100.0).values
 
@@ -199,30 +192,24 @@ def classify_rsi_zone(rsi):
 
 
 def get_fear_greed_value():
-    if HAS_FEAR_GREED_LIB:
-        try:
-            data = get_fear_and_greed()
-            val = data["fear_and_greed"]["now"]["value"]
-            return int(val)
-        except Exception:
-            pass
-
+    # 模擬標準瀏覽器 Request Headers，防止 CNN 防爬蟲阻斷
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Referer": "https://www.cnn.com/markets/fear-and-greed"
         }
         resp = requests.get(
             "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
             headers=headers,
-            timeout=5,
+            timeout=4,
         )
         if resp.ok:
             js = resp.json()
             latest = js["fear_and_greed"]["now"]["score"]
             return int(latest)
     except Exception:
-        return None
-
+        pass
     return None
 
 
@@ -230,12 +217,12 @@ def interpret_fear_greed(val: int) -> str:
     if val is None:
         return "無法取得 Fear & Greed 指數，請檢查網絡連接或 API 狀態。"
     if val > 75:
-        return "極度貪婪：市場高風險區，避免追高，適合分批止盈與提高止損。"
+        return "【極度貪婪】市場風險極高，避免盲目追高，適合分批止盈並上移保護止損。"
     if val < 30:
-        return "極度恐慌：泥沙俱下，往往是黃金建倉區，留意大膽分批進場機會。"
+        return "【極度恐慌】市場泥沙俱下，優質資產被錯殺，往往是黃金分批建倉區。"
     if 40 <= val <= 70:
-        return "正常震盪區：適合做突破交易與趨勢跟隨。"
-    return "中性區：可按照個股技術面靈活操作。"
+        return "【正常震盪區】市場趨勢延續性較強，適合做突破交易與順勢操作。"
+    return "【中性觀望區】多空均衡，可按照個股技術面與籌碼面靈活操作。"
 
 
 # ==============================
@@ -268,7 +255,7 @@ def compute_relative_strength(
     lookback_days: int = 60,
 ):
     today = datetime.now(tz=US_TZ)
-    start = today - timedelta(days=lookback_days * 3)  # 稍微拉長確保均線與技術指標計算完整
+    start = today - timedelta(days=lookback_days * 3)
 
     universe = load_universe()
     symbols = universe["symbol"].tolist()
@@ -277,7 +264,6 @@ def compute_relative_strength(
 
     rs_data = []
     for sym in symbols:
-        # 修正點：將原 TimeFrame.Day 改成字串 "day"
         df = get_bars(sym, start, today, "day")
         if df.empty or len(df) < lookback_days:
             continue
@@ -334,7 +320,7 @@ def evaluate_daytrade_conditions(df: pd.DataFrame):
     cond_price_ma = (price > ma5) and (price > ma20) if not (np.isnan(ma5) or np.isnan(ma20)) else False
     cond_rsi = 45 <= rsi <= 65
     cond_vwap = price > vwap if not np.isnan(vwap) else False
-    cond_cmf = cmf > 0.1  # 主力吸籌
+    cond_cmf = cmf > 0.1
 
     return {
         "price": price,
@@ -356,10 +342,10 @@ def atr_adaptive_stops(last_price, atr_value, atr_window_pct, stop_min_pct, stop
         stop_loss_pct = stop_min_pct
     else:
         atr_pct = atr_value / last_price
-        stop_loss_pct = atr_pct * atr_window_pct  # 例如 1.5 倍 ATR 乘數
+        stop_loss_pct = atr_pct * atr_window_pct
         stop_loss_pct = max(stop_min_pct, min(stop_loss_pct, stop_max_pct))
 
-    take_profit_pct = stop_loss_pct * 1.8  # 1.8 倍盈虧比
+    take_profit_pct = stop_loss_pct * 1.8
     stop_loss_price = last_price * (1 - stop_loss_pct)
     take_profit_price = last_price * (1 + take_profit_pct)
 
@@ -377,9 +363,8 @@ def atr_adaptive_stops(last_price, atr_value, atr_window_pct, stop_min_pct, stop
 
 def run_param_search(symbol: str, years: int = 2, n_samples: int = 100):
     today = datetime.now(tz=US_TZ)
-    start = today - timedelta(days=365 * years + 100) # 多抓時間給指標預熱
+    start = today - timedelta(days=365 * years + 100)
 
-    # 修正點：將原 TimeFrame.Day 改成字串 "day"
     df = get_bars(symbol, start, today, "day")
     if df.empty or len(df) < 60:
         return None
@@ -440,7 +425,6 @@ def generate_signal_from_cfg(symbol: str, cfg: dict):
     today = datetime.now(tz=US_TZ)
     start = today - timedelta(days=365)
 
-    # 修正點：將原 TimeFrame.Day 改成字串 "day"
     df = get_bars(symbol, start, today, "day")
     if df.empty or len(df) < max(14, cfg["ma_window"]):
         return None
@@ -504,6 +488,17 @@ st.title("🚀 美股 AI 強勢股雷達 v0.1")
 # ---- Sidebar ----
 st.sidebar.header("⚙️ 系統設定")
 
+# 1. 🔑 Alpaca 密鑰設置（折疊式面板，貼心防崩潰設計）
+with st.sidebar.expander("🔑 Alpaca API 金鑰設定", expanded=(not st.session_state["alpaca_key"])):
+    st.markdown("請在下方貼上您的 Alpaca 金鑰以啟動美股數據流：")
+    input_key = st.text_input("Alpaca API Key ID", value=st.session_state["alpaca_key"], type="password")
+    input_secret = st.text_input("Alpaca Secret Key", value=st.session_state["alpaca_secret"], type="password")
+    
+    if input_key != st.session_state["alpaca_key"] or input_secret != st.session_state["alpaca_secret"]:
+        st.session_state["alpaca_key"] = input_key
+        st.session_state["alpaca_secret"] = input_secret
+        st.rerun()
+
 mode = st.sidebar.radio(
     "交易模式",
     ["波段/位置交易", "日內極速 (Day Trade)"],
@@ -520,41 +515,63 @@ with st.sidebar.expander("🧠 AI 參數優化設定"):
     param_years = st.slider("回測年數", 1, 5, 2, step=1)
     param_samples = st.slider("參數樣本數 (類 Genetic)", 20, 200, 100, step=20)
 
-manual_symbol = st.sidebar.text_input("🔍 個股診斷代號（如 NVDA）", value="NVDA")
+manual_symbol = st.sidebar.text_input("🔍 個股診斷代號", value="NVDA")
 run_ai_opt = st.sidebar.button("啟動無監督網格自學習優化")
 
+
 # ==============================
-# 區塊 1：大盤情緒 (Fear & Greed)
+# 區塊 1：大盤情緒 (CNN Fear & Greed)
 # ==============================
 
 st.subheader("📊 大盤情緒診斷 - CNN Fear & Greed Index")
 
-fg_val = get_fear_greed_value()
+# 實施網絡防禦性編譯
+raw_fg_val = get_fear_greed_value()
+
+if raw_fg_val is None:
+    st.info("💡 溫馨提示：CNN 官方 sentiment 接口當前被 Streamlit 共享 IP 限制。已為您開啟備援模式，您可在下方手動微調市場情緒進行沙盤模擬。")
+    # 提供手動微調滑桿
+    fg_val = st.slider("🔮 模擬當前市場 Fear & Greed 指數", 0, 100, 50, step=1)
+else:
+    fg_val = raw_fg_val
+
 col1, col2 = st.columns([1, 3])
 
 with col1:
-    if fg_val is not None:
-        if fg_val > 75:
-            color = "red"
-        elif fg_val < 30:
-            color = "green"
-        else:
-            color = "orange"
-
-        st.markdown(
-            f"""
-            <div style="background-color:{color}; padding:20px; border-radius:10px; text-align:center; color:white;">
-                <div style="font-size:14px;">Fear & Greed</div>
-                <div style="font-size:36px; font-weight:bold;">{fg_val}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    if fg_val > 75:
+        color = "#ff4b4b"  # 鮮紅 (極度貪婪)
+    elif fg_val < 30:
+        color = "#21c354"  # 鮮綠 (極度恐慌)
     else:
-        st.warning("無法取得 Fear & Greed 指數，請稍後再試。")
+        color = "#fca311"  # 橙黃 (中性/震盪)
+
+    st.markdown(
+        f"""
+        <div style="background-color:{color}; padding:20px; border-radius:10px; text-align:center; color:white;">
+            <div style="font-size:15px; font-weight:bold; letter-spacing:1px;">FEAR & GREED</div>
+            <div style="font-size:42px; font-weight:bold; margin:10px 0;">{fg_val}</div>
+            <div style="font-size:12px; opacity:0.9;">{"CNN 實時 API 數據" if raw_fg_val is not None else "沙盤模擬模式"}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 with col2:
+    st.markdown(f"### 🚦 情緒宏觀解讀")
     st.write(interpret_fear_greed(fg_val))
+
+
+# ==============================
+# 數據加載攔截安全閘 (API Key 檢查)
+# ==============================
+has_keys = bool(st.session_state["alpaca_key"] and st.session_state["alpaca_secret"])
+
+if not has_keys:
+    st.markdown("---")
+    st.warning("⚠️ **請先展開左側【🔑 Alpaca API 金鑰設定】輸入您的金鑰。** 金鑰輸入後，系統將實時向 Alpaca 加載最真實的華爾街交易數據。")
+    st.info("💡 如果您還沒有 Alpaca 帳戶，可以去 [Alpaca 官網](https://alpaca.markets/) 免費註冊一個模擬盤 (Paper Trading) 帳戶，幾分鐘內即可獲得免費 API 金鑰！")
+    st.stop()
+
 
 # ==============================
 # 區塊 2：RS 強勢股 & 行業領頭羊
@@ -565,7 +582,7 @@ st.subheader("🏆 全市場 RS 強勢股 & 行業領頭羊（基於 SPY）")
 rs_df = compute_relative_strength(lookback_days=rs_lookback)
 
 if rs_df.empty:
-    st.warning("無法取得 RS 排名，請檢查 Alpaca API 是否設定正確以及環境變數。")
+    st.warning("無法取得 RS 排名，請確認您的 Alpaca API 是否開通美股歷史數據訪問權限。")
 else:
     sort_order = st.radio("RS 排序方向", ["由強到弱", "由弱到強"], horizontal=True)
     ascending = sort_order == "由弱到強"
@@ -577,7 +594,6 @@ else:
 
     st.dataframe(rs_df_display, use_container_width=True)
 
-    # 每日各行業領頭羊
     st.markdown("**各行業 RS 領頭羊**")
     leaders = (
         rs_df.assign(rank=rs_df["rs_score"].rank(ascending=False, method="first"))
@@ -593,6 +609,7 @@ else:
     ]
     st.dataframe(leaders_display, use_container_width=True)
 
+
 # ==============================
 # 區塊 3：開市前 & 開盤衝刺 VWAP + RVOL 雷達
 # ==============================
@@ -604,11 +621,11 @@ if rs_df.empty:
 else:
     top_symbols = rs_df.head(20)["symbol"].tolist()
     today = datetime.now(tz=US_TZ)
-    start_intraday = today - timedelta(hours=4)
+    # 智能跨期補償：拉長到過去 5 天，防止在非交易日或週末時獲取不到數據
+    start_intraday = today - timedelta(days=5)
 
     breakout_rows = []
     for sym in top_symbols:
-        # 修正點：將原 TimeFrame.Minute 改成字串 "minute"
         df_i = get_bars(sym, start_intraday, today, "minute")
         if df_i.empty or len(df_i) < 2:
             continue
@@ -634,11 +651,12 @@ else:
         )
 
     if not breakout_rows:
-        st.info("目前沒有符合 VWAP + RVOL 條件的爆發股候選。")
+        st.info("當前時段沒有符合 VWAP + RVOL 條件的爆發股候選。")
     else:
         breakout_df = pd.DataFrame(breakout_rows)
         breakout_df = breakout_df.sort_values("rvol", ascending=False)
         st.dataframe(breakout_df, use_container_width=True)
+
 
 # ==============================
 # 區塊 4：個股診斷 & AI 決策
@@ -651,10 +669,9 @@ if symbol:
     today = datetime.now(tz=US_TZ)
     start_daily = today - timedelta(days=365 * 2)
 
-    # 修正點：將原 TimeFrame.Day 改成字串 "day"
     df_daily = get_bars(symbol, start_daily, today, "day")
     if df_daily.empty:
-        st.warning(f"無法取得 {symbol} 日線數據。請確認代號或 Alpaca 權限。")
+        st.warning(f"無法取得 {symbol} 日線數據。請確認美股代號是否正確，或您的 Alpaca 金鑰是否支援此數據。")
     else:
         df_daily = add_technicals(df_daily.sort_values("timestamp"))
         last_d = df_daily.iloc[-1]
@@ -674,21 +691,20 @@ if symbol:
 
         st.write(f"RSI 狀態：**{classify_rsi_zone(last_d['rsi14'])}**")
 
-        # Smart Money Board
         sm = get_smart_money_metrics(symbol)
         st.markdown("#### 💼 華爾街籌碼追蹤（預留）")
         st.write(f"- 機構持股比例：{sm['institutional_held'] if sm['institutional_held'] is not None else '待接 API'}")
         st.write(f"- 內部人持股比例：{sm['insider_held'] if sm['insider_held'] is not None else '待接 API'}")
         st.write(f"- 空頭持倉佔比：{sm['short_float'] if sm['short_float'] is not None else '待接 API'}")
 
-        # AI 參數優化
+        # AI 參數自學習優化
         if run_ai_opt:
             with st.spinner("🧠 AI 正在為你摸索黃金參數組合..."):
                 cfg = run_param_search(
                     symbol, years=param_years, n_samples=param_samples
                 )
             if cfg is None:
-                st.error("參數優化失敗，可能是歷史數據不足。")
+                st.error("參數優化失敗，可能是歷史數據長度不足。")
             else:
                 st.success(f"🎆 AI 完成自學習！最佳組合：RSI 買入 < {cfg['rsi_buy']}, MA{cfg['ma_window']}。")
                 pf = cfg["pf"]
@@ -714,14 +730,13 @@ if symbol:
                         f"- 目標止盈點：約 {signal_info['take_profit_price']:.2f}"
                     )
         else:
-            st.info("如要啟動 AI 自學習優化，請在左側輸入代號後按按鈕。")
+            st.info("💡 如要啟動 AI 參數尋優，請在左側確認代號後點擊【啟動無監督網格自學習優化】。")
 
         # Day Trade 模式診斷
         st.markdown("---")
         st.markdown("### ⚡ 日內模式診斷 (5 分鐘 K 線 + VWAP + ATR)")
 
-        start_intraday = today - timedelta(days=5) # 抓多幾日數據確保有足夠的 K 線做 resampling
-        # 修正點：將原 TimeFrame.Minute 改成字串 "minute"
+        start_intraday = today - timedelta(days=5)
         df_5m = get_bars(symbol, start_intraday, today, "minute")
         if df_5m.empty:
             st.warning("無法取得日內分時數據。")
